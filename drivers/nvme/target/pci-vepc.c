@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * Virtual PCIe Endpoint Controller
+ */
 #include <linux/pci.h>
 #include <linux/types.h>
 #include <linux/platform_device.h>
@@ -5,6 +9,8 @@
 #include <linux/compiler_types.h>
 #include <linux/kthread.h>
 #include <linux/pci-epc.h>
+#include <linux/configfs.h>
+#include <linux/kstrtox.h>
 
 #define MSI_NR_VECTORS 64
 
@@ -71,3 +77,265 @@ struct vepc_dev {
 	/* for both */
 	u32 access_filter;
 };
+
+struct vepc_dev *vepc_dev;
+
+static ssize_t vepc_cfg_hotplug_store(struct config_item *item, const char *page, size_t len)
+{
+	bool plug;
+	if(kstrtobool(page, &plug))
+		return -EINVAL;
+	if(!plug)
+		return -EINVAL;
+
+	pr_info("hotplug requested!\n");
+
+	return len;
+}
+CONFIGFS_ATTR_WO(vepc_cfg_, hotplug);
+
+static ssize_t vepc_cfg_hotremove_store(struct config_item *item, const char *page, size_t len)
+{
+	bool remove;
+	if(kstrtobool(page, &remove))
+		return -EINVAL;
+	if(!remove)
+		return -EINVAL;
+
+	pr_info("hotremoval requested!\n");
+
+	return len;
+}
+CONFIGFS_ATTR_WO(vepc_cfg_, hotremove);
+
+
+static DEFINE_MUTEX(cfg_lock);
+static u16 rc_vid;
+static u16 rc_pid;
+static u16 ep_vid;
+static u16 ep_pid;
+static u64 bar0_phys;
+static u32 bar0_size;
+
+static ssize_t vepc_cfg_enable_store(struct config_item *item, const char *page, size_t len)
+{
+	bool enable;
+	if(kstrtobool(page, &enable))
+		return -EINVAL;
+
+	mutex_lock(&cfg_lock);
+	pr_info("enable = %d!\n", enable);
+	mutex_unlock(&cfg_lock);
+
+	return len;
+}
+CONFIGFS_ATTR_WO(vepc_cfg_, enable);
+
+static ssize_t vepc_cfg_rc_vid_show(struct config_item *item, char *page)
+{
+	ssize_t ret;
+	mutex_lock(&cfg_lock);
+	ret = sysfs_emit(page, "0x%x\n", rc_vid);
+	mutex_unlock(&cfg_lock);
+
+	return ret;
+}
+
+static ssize_t vepc_cfg_rc_vid_store(struct config_item *item, const char *page, size_t len)
+{
+	u16 vid;
+	if(!len)
+		return -EINVAL;
+	if(kstrtou16(page, 0, &vid))
+		return -EINVAL;
+
+	mutex_lock(&cfg_lock);
+	rc_vid = vid;
+	mutex_unlock(&cfg_lock);
+
+	return len;
+}
+CONFIGFS_ATTR(vepc_cfg_, rc_vid);
+
+static ssize_t vepc_cfg_rc_pid_show(struct config_item *item, char *page)
+{
+	ssize_t ret;
+	mutex_lock(&cfg_lock);
+	ret = sysfs_emit(page, "0x%x\n", rc_pid);
+	mutex_unlock(&cfg_lock);
+
+	return ret;
+}
+
+static ssize_t vepc_cfg_rc_pid_store(struct config_item *item, const char *page, size_t len)
+{
+	u16 pid;
+	if(!len)
+		return -EINVAL;
+	if(kstrtou16(page, 0, &pid))
+		return -EINVAL;
+
+	mutex_lock(&cfg_lock);
+	rc_pid = pid;
+	mutex_unlock(&cfg_lock);
+
+	return len;
+}
+CONFIGFS_ATTR(vepc_cfg_, rc_pid);
+
+static ssize_t vepc_cfg_ep_vid_show(struct config_item *item, char *page)
+{
+	ssize_t ret;
+	mutex_lock(&cfg_lock);
+	ret = sysfs_emit(page, "0x%x\n", ep_vid);
+	mutex_unlock(&cfg_lock);
+
+	return ret;
+}
+
+static ssize_t vepc_cfg_ep_vid_store(struct config_item *item, const char *page, size_t len)
+{
+	u16 vid;
+	if(!len)
+		return -EINVAL;
+	if(kstrtou16(page, 0, &vid))
+		return -EINVAL;
+
+	mutex_lock(&cfg_lock);
+	ep_vid = vid;
+	mutex_unlock(&cfg_lock);
+
+	return len;
+}
+CONFIGFS_ATTR(vepc_cfg_, ep_vid);
+
+static ssize_t vepc_cfg_ep_pid_show(struct config_item *item, char *page)
+{
+	ssize_t ret;
+	mutex_lock(&cfg_lock);
+	ret = sysfs_emit(page, "0x%x\n", ep_pid);
+	mutex_unlock(&cfg_lock);
+
+	return ret;
+}
+
+static ssize_t vepc_cfg_ep_pid_store(struct config_item *item, const char *page, size_t len)
+{
+	u16 pid;
+	if(!len)
+		return -EINVAL;
+	if(kstrtou16(page, 0, &pid))
+		return -EINVAL;
+
+	mutex_lock(&cfg_lock);
+	ep_pid = pid;
+	mutex_unlock(&cfg_lock);
+
+	return len;
+}
+CONFIGFS_ATTR(vepc_cfg_, ep_pid);
+
+static ssize_t vepc_cfg_bar0_phys_show(struct config_item *item, char *page)
+{
+	ssize_t ret;
+	mutex_lock(&cfg_lock);
+	ret = sysfs_emit(page, "0x%llx\n", bar0_phys);
+	mutex_unlock(&cfg_lock);
+
+	return ret;
+}
+
+static ssize_t vepc_cfg_bar0_phys_store(struct config_item *item, const char *page, size_t len)
+{
+	u64 bar0;
+	if(!len)
+		return -EINVAL;
+	if(kstrtou64(page, 0, &bar0))
+		return -EINVAL;
+
+	mutex_lock(&cfg_lock);
+	bar0_phys = bar0;
+	mutex_unlock(&cfg_lock);
+
+	return len;
+}
+CONFIGFS_ATTR(vepc_cfg_, bar0_phys);
+
+static ssize_t vepc_cfg_bar0_size_show(struct config_item *item, char *page)
+{
+	ssize_t ret;
+	mutex_lock(&cfg_lock);
+	ret = sysfs_emit(page, "0x%x\n", bar0_size);
+	mutex_unlock(&cfg_lock);
+
+	return ret;
+}
+
+static ssize_t vepc_cfg_bar0_size_store(struct config_item *item, const char *page, size_t len)
+{
+	u32 bar0;
+	if(!len)
+		return -EINVAL;
+	if(kstrtou32(page, 0, &bar0))
+		return -EINVAL;
+
+	mutex_lock(&cfg_lock);
+	bar0_size = bar0;
+	mutex_unlock(&cfg_lock);
+
+	return len;
+}
+CONFIGFS_ATTR(vepc_cfg_, bar0_size);
+
+static struct configfs_attribute *vepc_cfg_attrs[] = {
+	&vepc_cfg_attr_hotplug,
+	&vepc_cfg_attr_hotremove,
+	&vepc_cfg_attr_enable,
+	&vepc_cfg_attr_rc_vid,
+	&vepc_cfg_attr_rc_pid,
+	&vepc_cfg_attr_ep_vid,
+	&vepc_cfg_attr_ep_pid,
+	&vepc_cfg_attr_bar0_phys,
+	&vepc_cfg_attr_bar0_size,
+	NULL
+};
+
+static const struct config_item_type vepc_cfg_root_type = {
+	.ct_owner = THIS_MODULE,
+	.ct_attrs = vepc_cfg_attrs,
+};
+
+static struct configfs_subsystem vepc_cfg_subsys = {
+	.su_group = {
+		.cg_item = {
+			.ci_namebuf = "vepc",
+			.ci_type = &vepc_cfg_root_type,
+		},
+	},
+	.su_mutex = __MUTEX_INITIALIZER(vepc_cfg_subsys.su_mutex),
+};
+
+
+static int __init vepc_init_module(void)
+{
+	int rc;
+	config_group_init(&vepc_cfg_subsys.su_group);
+	rc = configfs_register_subsystem(&vepc_cfg_subsys);
+	if(rc) {
+		pr_err("configfs_register_subsystem() failed: %d\n", rc);
+		return rc;
+	}
+	return 0;
+}
+
+static void __exit vepc_exit_module(void)
+{
+	configfs_unregister_subsystem(&vepc_cfg_subsys);
+}
+
+module_init(vepc_init_module);
+module_exit(vepc_exit_module);
+
+MODULE_DESCRIPTION("Virtual PCI Endpoint Controller for NVMe target driver");
+MODULE_AUTHOR("Mateusz Nowicki <mateusz.nowicki@posteo.net>");
+MODULE_LICENSE("GPL");

@@ -24,3 +24,4 @@ nvme-fcloop-y	+= fcloop.o
 nvmet-tcp-y	+= tcp.o
 nvmet-pci-epf-y	+= pci-epf.o
 nvmet-$(CONFIG_TRACING)	+= trace.o
+nvmet-pci-vepc-y += pci-vepc.o
