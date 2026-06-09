@@ -681,6 +681,9 @@ static int __init vepc_init_module(void)
 		goto group_relese;
 	}
 
+	pr_info("vepc_init complete!\n");
+	return 0;
+
 group_relese:
 	configfs_unregister_subsystem(&vepc_cfg_subsys);
 
