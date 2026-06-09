@@ -723,6 +723,8 @@ static int rc_init(struct vepc_dev *vepc)
 		pr_err("reg_space_init() failed: %d\n", rc);
 		return rc;
 	}
+	vepc->rc_regs.dev = vepc;
+
 	rc = rc_reset(RESET_POWER_ON, vepc);
 	if(rc)
 	{
