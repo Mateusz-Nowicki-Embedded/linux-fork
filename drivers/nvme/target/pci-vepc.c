@@ -318,7 +318,7 @@ static int pci_read(struct pci_bus *bus, unsigned int devfn, int where, int size
 	struct vepc_dev *vepc = container_of(bus->sysdata, struct vepc_dev, sysdata);
 	*val = 0xFFFFFF; //TODO: better define needed
 	
-	pr_info("read bus: 0x%x, where: 0x%x, size: 0x%x\n", bus->number, where, size);
+	pr_info("read bus: 0x%x, devfn: 0x%x,  where: 0x%x, size: 0x%x\n", bus->number, devfn, where, size);
 
 	if(size != 1 && size != 2 && size != 4)
 		return PCIBIOS_BAD_REGISTER_NUMBER;	//support only 1,2,4
@@ -462,6 +462,13 @@ static ssize_t vepc_cfg_enable_store(struct config_item *item, const char *page,
 			mutex_unlock(&cfg_lock);
 			return -EINVAL;
 		}
+
+		vepc_dev->rc_did = rc_did;
+		vepc_dev->rc_vid = rc_vid;
+		vepc_dev->ep_did = ep_did;
+		vepc_dev->ep_vid = ep_vid;
+		vepc_dev->bar0_phys = bar0_phys;
+		vepc_dev->bar0_size = bar0_size;
 
 		//enable controller
 		pr_info("enabling...\n");
