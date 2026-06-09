@@ -94,7 +94,7 @@ enum acc_flags {
 };
 struct vepc_dev *vepc_dev;
 
-static int rc_int(struct vepc_dev *vepc);
+static int rc_init(struct vepc_dev *vepc);
 static int rc_exit(struct vepc_dev *vepc);
 static int rc_hotplug(struct vepc_dev *vepc);
 static int rc_hotremove(struct vepc_dev *vepc);
@@ -464,7 +464,9 @@ static ssize_t vepc_cfg_enable_store(struct config_item *item, const char *page,
 
 		//enable controller
 		pr_info("enabling...\n");
-		rc_hotplug(vepc_dev);
+		int rc = rc_hotplug(vepc_dev);
+		if(rc)
+			return rc;
 	}
 	else
 	{
@@ -679,16 +681,6 @@ static int __init vepc_init_module(void)
 		goto group_relese;
 	}
 
-	rc = rc_int(vepc_dev);
-	if(rc)
-		goto vepc_dev_relese;
-
-	return 0;
-
-vepc_dev_relese:
-	kfree(vepc_dev);
-	vepc_dev = NULL;
-
 group_relese:
 	configfs_unregister_subsystem(&vepc_cfg_subsys);
 
@@ -700,17 +692,19 @@ static void __exit vepc_exit_module(void)
 	if(vepc_dev)
 	{
 		configfs_unregister_subsystem(&vepc_cfg_subsys);
-		rc_exit(vepc_dev);
 	}
 }
 
-static int rc_int(struct vepc_dev *vepc)
+static int rc_init(struct vepc_dev *vepc)
 {
 	int rc;
 
 	rc = reg_space_init(&vepc->rc_regs, rc_regs_layout, rc_regs_layout_size);
 	if(rc)
+	{
+		pr_err("reg_space_init() failed: %d\n", rc);
 		return rc;
+	}
 	rc = rc_reset(RESET_POWER_ON, vepc);
 	if(rc)
 	{
@@ -739,7 +733,7 @@ static int rc_int(struct vepc_dev *vepc)
 
 	/* add resources */
 	vepc->bus_res	= (struct resource) {
-		.name	= "vrc-busn",
+		.name	= "vepc-busn",
 		.start	= 0x00,
 		.end	= 0xFF,
 		.flags	= IORESOURCE_BUS,
@@ -747,7 +741,7 @@ static int rc_int(struct vepc_dev *vepc)
 	pci_add_resource(&bridge->windows, &vepc->bus_res);
 
 	vepc->mem_res	= (struct resource) {
-		.name	= "vrc-mem",
+		.name	= "vepc-mem",
 		.start	= RC_MEM_BASE(vepc->bar0_phys),
 		.end	= RC_MEM_LIMIT(vepc->bar0_phys),
 		.flags	= IORESOURCE_MEM | IORESOURCE_MEM_64 | IORESOURCE_PREFETCH,
@@ -793,6 +787,8 @@ static int rc_int(struct vepc_dev *vepc)
 	pci_bus_size_bridges(bridge->bus);
 	pci_bus_assign_resources(bridge->bus);
 	vepc->bridge = bridge;
+	
+	pci_bus_add_devices(bridge->bus);
 
 	return 0;
 
@@ -816,6 +812,14 @@ destroy_regs:
 
 static int rc_exit(struct vepc_dev *vepc)
 {
+	msi_domain_destroy(vepc);
+	if(vepc->sysdata.domain)
+		pci_bus_release_emul_domain_nr(vepc->sysdata.domain);
+	if(vepc->bridge)
+	{
+		pci_free_resource_list(&vepc->bridge->windows);
+		vepc->bridge = NULL;
+	}
 	platform_device_unregister(vepc->plat_dev);
 	vepc->plat_dev = NULL;
 	reg_space_destroy(&vepc->rc_regs);
@@ -824,41 +828,186 @@ static int rc_exit(struct vepc_dev *vepc)
 
 static int rc_hotplug(struct vepc_dev *vepc)
 {
-	return 0;
+	return rc_init(vepc);
 }
 
 static int rc_hotremove(struct vepc_dev *vepc)
 {
-	return 0;
+	return rc_exit(vepc);
+}
+
+static size_t reg_find_first(const struct reg_space *space, u32 offset)
+{
+	size_t lo = 0, hi = space->n_entries;
+	while(lo < hi) {
+		size_t mid = lo + (hi - lo) / 2;
+		const struct reg_entry *e = &space->entries[mid];
+
+		if((u32) e->offset + e->size <= offset)
+			lo = mid + 1;
+		else
+			hi = mid;
+
+	}
+	return lo;
+}
+
+static u32 reg_incoming(u32 access_start, u32 access_end,
+			u32 reg_base, u32 reg_size, u32 write_val)
+{
+	const u32 reg_end = reg_base + reg_size;
+	const u32 lo = max(reg_base, access_start);
+	const u32 hi = min(reg_end, access_end);
+	u32 incoming = 0, addr;
+
+	for (addr = lo; addr < hi; ++addr)
+		incoming |= (u32)((write_val >> (8 * (addr - access_start))) & 0xff)
+			    << (8 * (addr - reg_base));
+	return incoming;
+}
+
+static u32 reg_filter_write(const struct reg_state *state, u32 access_start,
+			    u32 access_end, u32 reg_base, u32 reg_size,
+			    u32 ro_mask, u32 rw1c_mask, u32 write_val)
+{
+	const u32 reg_end = reg_base + reg_size;
+	const u32 copy_lo = max(reg_base, access_start);
+	const u32 copy_hi = min(reg_end, access_end);
+	u32 byte_mask = 0;
+	u32 incoming;
+	u32 rw1c_bits, rw_bits, old, new;
+	u32 addr;
+
+	for (addr = copy_lo; addr < copy_hi; ++addr)
+		byte_mask |= (u32)0xff << (8 * (addr - reg_base));
+
+	incoming = reg_incoming(access_start, access_end, reg_base, reg_size,
+				write_val);
+
+	rw1c_bits = rw1c_mask & byte_mask;
+	rw_bits = ~ro_mask & ~rw1c_mask & byte_mask;
+
+	old = state->val;
+	new = (old & ~rw_bits) | (incoming & rw_bits);
+	new &= ~(incoming & rw1c_bits);
+	return new;
 }
 
 static int reg_space_init(struct reg_space *space, const struct reg_entry *entries, size_t n_entries)
 {
+
 	return 0;
 }
 
 static int reg_space_destroy(struct reg_space *space)
 {
+	kfree(space->states);
+	space->states	 = NULL;
+	space->entries	 = NULL;
+	space->n_entries = 0;
 	return 0;
+}
+
+static void reg_copy_overlap(u32 *result, u32 access_start, u32 access_end,
+			     u32 reg_base, u32 reg_size, u32 reg_val)
+{
+	const u32 reg_end = reg_base + reg_size;
+	const u32 copy_lo = max(reg_base, access_start);
+	const u32 copy_hi = min(reg_end, access_end);
+	u32 addr;
+
+	for (addr = copy_lo; addr < copy_hi; ++addr) {
+		const u32 shift_in_reg = 8 * (addr - reg_base);
+		const u32 shift_in_result = 8 * (addr - access_start);
+		const u8 byte = (reg_val >> shift_in_reg) & 0xff;
+
+		*result |= (u32)byte << shift_in_result;
+	}
 }
 
 static int reg_read(struct reg_space *space, u32 offset, u32 size, u32 *val)
 {
-	return 0;
+	const u32 access_start = offset;
+	const u32 access_end = offset + size;
+	u32 result = 0x0;	//retrn 0 for unimplemented regs
+	size_t i;
+
+	for (i = reg_find_first(space, access_start); i < space->n_entries; ++i) {
+		const struct reg_entry *e = &space->entries[i];
+		const u32 reg_base = e->offset;
+
+		if (reg_base >= access_end)
+			break;
+
+		//TODO: needs some locking? maybe on dispatcher level
+		/* read handler (if any) supplies the value, bypassing state */
+		u32 cur = e->read_handler
+			? e->read_handler(space->dev, (struct reg_entry *)e,
+					  &space->states[i])
+			: space->states[i].val;
+
+		reg_copy_overlap(&result, access_start, access_end,
+				 reg_base, e->size, cur);
+	}
+
+	*val = result;
+	return PCIBIOS_SUCCESSFUL;
 }
 
 static int reg_write(struct reg_space *space, u32 offset, u32 size, u32 val)
 {
-	return 0;
+	const u32 access_start = offset;
+	const u32 access_end = offset + size;
+	size_t i;
+
+	for (i = reg_find_first(space, access_start); i < space->n_entries; ++i) {
+		const struct reg_entry *e = &space->entries[i];
+		const u32 reg_base = e->offset;
+
+		if (reg_base >= access_end)
+			break;
+
+		u32 filtered_val = reg_filter_write(&space->states[i], access_start,
+						    access_end, reg_base, e->size,
+						    e->ro_mask, e->rw1c_mask, val);
+
+		if (e->write_handler)
+			e->write_handler(space->dev, (struct reg_entry *)e,
+					 &space->states[i], filtered_val);
+		else
+			space->states[i].val = filtered_val;
+	}
+
+	return PCIBIOS_SUCCESSFUL;
 }
 
 static int reg_write_direct(struct reg_space *space, u32 offset, u32 size, u32 val)
 {
+	size_t i = reg_find_first(space, offset);
+
+	if (i >= space->n_entries)
+		return -EINVAL;
+
+	const struct reg_entry *e = &space->entries[i];
+
+	if ((u32)e->offset != offset || e->size != size)
+		return -EINVAL;
+
+	switch(size)
+	{
+	case 1: space->states[i].val = val & 0xFF; break;
+	case 2: space->states[i].val = val & 0xFFFF; break;
+	case 4: space->states[i].val = val; break;
+	default: return EINVAL;
+	}
+
 	return 0;
 }
 
 static int reg_set_default_values(struct reg_space *space)
 {
+	for(size_t i=0; i < space->n_entries; ++i)
+		space->states[i].val = space->entries[i].default_val;
 	return 0;
 }
 
@@ -878,47 +1027,223 @@ static int rc_reset(enum reset_type reset, struct vepc_dev *vepc)
 
 static int ep_reg_read(struct vepc_dev *vepc, int where, int size, u32 *val)
 {
-	return 0;
+	if(vepc->access_filter & ACC_F_EP_UR)
+	{
+		*val = 0xFFFFFFFF;
+		return PCIBIOS_SUCCESSFUL;
+	}
+	if(vepc->access_filter & ACC_F_EP_CRS)
+	{
+		*val = 0xFFFF0001;
+		return PCIBIOS_SUCCESSFUL;
+	}
+	return reg_read(&vepc->ep_regs, where, size, val);
 }
 
 static int ep_reg_write(struct vepc_dev *vepc, int where, int size, u32 val)
 {
-	return 0;
+	if((vepc->access_filter & ACC_F_EP_UR) || (vepc->access_filter & ACC_F_EP_UR))
+		return PCIBIOS_DEVICE_NOT_FOUND;
+
+	return reg_write(&vepc->ep_regs, where, size, val);
 }
 
 static int rc_reg_read(struct vepc_dev *vepc, int where, int size, u32 *val)
 {
-	return 0;
+	if(vepc->access_filter & ACC_F_RC_UR)
+	{
+		*val = 0xFFFFFFFF;
+		return PCIBIOS_SUCCESSFUL;
+	}
+	if(vepc->access_filter & ACC_F_RC_CRS)
+	{
+		*val = 0xFFFF0001;
+		return PCIBIOS_SUCCESSFUL;
+	}
+	return reg_read(&vepc->rc_regs, where, size, val);
 }
 
 static int rc_reg_write(struct vepc_dev *vepc, int where, int size, u32 val)
 {
+	if((vepc->access_filter & ACC_F_RC_UR) || (vepc->access_filter & ACC_F_RC_UR))
+		return PCIBIOS_DEVICE_NOT_FOUND;
+
+	return reg_write(&vepc->rc_regs, where, size, val);
+}
+
+static void msi_compose_msg(struct irq_data *d, struct msi_msg *msg)
+{
+	/* token only — delivery is via generic_handle_irq_safe(), never a real MSI write */
+	msg->address_lo = 0;
+	msg->address_hi = 0;
+	msg->data = d->hwirq;
+}
+
+static struct irq_chip msi_bottom_chip = {	/* NOT const: DEF_CHIP_OPS patches it in place */
+	.name = "vEPC-MSI",
+	.irq_compose_msi_msg = msi_compose_msg,
+};
+
+static int msi_domain_alloc(struct irq_domain *domain, unsigned int virq,
+				  unsigned int nr_irqs, void *arg)
+{
+	unsigned long bit;
+	struct vepc_dev *vepc = domain->host_data;
+
+	WARN_ON(nr_irqs != 1);
+
+	mutex_lock(&vepc->msi_lock);
+	bit = find_first_zero_bit(vepc->msi_used, MSI_NR_VECTORS);
+	if (bit >= MSI_NR_VECTORS) {
+		mutex_unlock(&vepc->msi_lock);
+		return -ENOSPC;
+	}
+	set_bit(bit, vepc->msi_used);
+	mutex_unlock(&vepc->msi_lock);
+
+	irq_domain_set_info(domain, virq, bit, &msi_bottom_chip,
+			    domain->host_data, handle_simple_irq, NULL, NULL);
+
+	msi_alloc_info_t *info = arg;
+        struct msi_desc *desc = info ? info->desc : NULL;
+
+        if (desc && dev_is_pci(desc->dev)) {
+                struct pci_dev *pdev = to_pci_dev(desc->dev);
+
+                /* root port == bus 0; hot-plug vector == Interrupt Message Number 0 */
+                if (pdev->bus->number == 0 && desc->msi_index == 0)
+                        WRITE_ONCE(vepc->slot_irq, virq);
+        }
+
 	return 0;
 }
 
-static int msi_domain_create(struct vepc_dev *vepc, struct device *bridge)
+static void msi_domain_free(struct irq_domain *domain, unsigned int virq,
+				  unsigned int nr_irqs)
 {
+	struct irq_data *d = irq_domain_get_irq_data(domain, virq);
+	struct vepc_dev *vepc = domain->host_data;
+
+	mutex_lock(&vepc->msi_lock);
+	__clear_bit(d->hwirq, vepc->msi_used);
+	mutex_unlock(&vepc->msi_lock);
+}
+
+static const struct irq_domain_ops msi_domain_ops = {
+	.alloc = msi_domain_alloc,
+	.free  = msi_domain_free,
+};
+
+#define VEPC_MSI_FLAGS_REQUIRED  (MSI_FLAG_USE_DEF_DOM_OPS | \
+				   MSI_FLAG_USE_DEF_CHIP_OPS | \
+				   MSI_FLAG_NO_AFFINITY)
+#define VEPC_MSI_FLAGS_SUPPORTED (MSI_GENERIC_FLAGS_MASK | \
+				   MSI_FLAG_PCI_MSIX)
+
+static bool init_dev_msi_info(struct device *dev, struct irq_domain *domain,
+				    struct irq_domain *real_parent,
+				    struct msi_domain_info *info)
+{
+	const struct msi_parent_ops *pops = real_parent->msi_parent_ops;
+
+	if (WARN_ON_ONCE(!pops))
+		return false;
+
+	/* We are the root MSI parent. */
+	if (domain->bus_token == pops->bus_select_token) {
+		if (WARN_ON_ONCE(domain != real_parent))
+			return false;
+	} else {
+		WARN_ON_ONCE(1);
+		return false;
+	}
+
+	/* Only PCI MSI / MSI-X child domains are expected. */
+	switch (info->bus_token) {
+	case DOMAIN_BUS_PCI_DEVICE_MSI:
+	case DOMAIN_BUS_PCI_DEVICE_MSIX:
+		if (WARN_ON_ONCE(!IS_ENABLED(CONFIG_PCI_MSI)))
+			return false;
+		break;
+	default:
+		WARN_ON_ONCE(1);
+		return false;
+	}
+
+	/* Mask to parent-supported flags, then enforce the required ones. */
+	info->flags &= pops->supported_flags;
+	info->flags |= pops->required_flags;
+
+	return true;
+}
+
+static const struct msi_parent_ops msi_parent_ops = {
+	.required_flags    = VEPC_MSI_FLAGS_REQUIRED,
+	.supported_flags   = VEPC_MSI_FLAGS_SUPPORTED,
+	.bus_select_token  = DOMAIN_BUS_PCI_MSI,
+	.prefix            = "vEPC-",
+	.init_dev_msi_info = init_dev_msi_info,
+};
+
+static int msi_domain_create(struct vepc_dev *vepc, struct device *bridge_dev)
+{
+	struct irq_domain_info info = {
+		.fwnode    = irq_domain_alloc_named_id_fwnode("vEPC-MSI", vepc->sysdata.domain),
+		.ops       = &msi_domain_ops,
+		.host_data = vepc,
+		.size      = MSI_NR_VECTORS,
+	};
+
+	if (!info.fwnode)
+		return -ENOMEM;
+
+	mutex_init(&vepc->msi_lock);
+
+	vepc->msi_fwnode = info.fwnode;
+	vepc->msi_domain = msi_create_parent_irq_domain(&info, &msi_parent_ops);
+	if (!vepc->msi_domain) {	/* returns NULL (not ERR_PTR) on failure */
+		irq_domain_free_fwnode(vepc->msi_fwnode);
+		vepc->msi_fwnode = NULL;
+		return -ENOMEM;
+	}
+
+	dev_set_msi_domain(bridge_dev, vepc->msi_domain);
 	return 0;
 }
 
 static void msi_domain_destroy(struct vepc_dev *vepc)
 {
-
+	if (vepc->msi_domain) {
+		irq_domain_remove(vepc->msi_domain);
+		vepc->msi_domain = NULL;
+	}
+	if (vepc->msi_fwnode) {
+		irq_domain_free_fwnode(vepc->msi_fwnode);
+		vepc->msi_fwnode = NULL;
+	}
+	mutex_destroy(&vepc->msi_lock);
 }
+
 
 static void msi_hotplug_irq(struct vepc_dev *vepc)
 {
+	int virq = READ_ONCE(vepc->slot_irq);
 
+	if (!virq) {
+		pr_warn("hotplug IRQ skipped: root-port MSI not enabled\n");
+		return;
+	}
+	generic_handle_irq_safe(virq);
 }
 
 static void set_access_filter(struct vepc_dev *vepc, enum acc_flags flags)
 {
-
+	vepc->access_filter |= flags;
 }
 
 static void clear_access_filter(struct vepc_dev *vepc, enum acc_flags flags)
 {
-
+	vepc->access_filter &= ~(flags);
 }
 
 static int bus_notify(struct notifier_block *nb, unsigned long action, void *data)
