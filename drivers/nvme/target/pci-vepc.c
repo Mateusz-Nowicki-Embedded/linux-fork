@@ -53,7 +53,7 @@ struct vepc_dev {
 	u16 ep_vid;
 	u16 ep_did;
 	u64 bar0_phys;
-	u32 bar0_size;
+	u64 bar0_size;
 	void __iomem *bar0_virt;
 	struct reg_space ep_regs;
 	struct pci_epc *epc;
@@ -99,6 +99,12 @@ static int rc_exit(struct vepc_dev *vepc);
 static int rc_hotplug(struct vepc_dev *vepc);
 static int rc_hotremove(struct vepc_dev *vepc);
 static int rc_reset(enum reset_type reset, struct vepc_dev *vepc);
+
+static int ep_init(struct vepc_dev *vepc);
+static int ep_exit(struct vepc_dev *vepc);
+static int ep_hotplug(struct vepc_dev *vepc);
+static int ep_hotremove(struct vepc_dev *vepc);
+static int ep_reset(enum reset_type reset, struct vepc_dev *vepc);
 
 static int reg_space_init(struct reg_space *space, const struct reg_entry *entries, size_t n_entries);
 static int reg_space_destroy(struct reg_space *space);
@@ -313,6 +319,280 @@ const struct reg_entry rc_regs_layout[] = {
 };
 const size_t rc_regs_layout_size = ARRAY_SIZE(rc_regs_layout);
 
+
+#define BAR0_TYPE 0xCu   /* memory space, 64-bit, prefetchable */
+
+static void bar0_write_lo(struct vepc_dev *vepc, struct reg_entry *self, struct reg_state *state, u32 val)
+{
+	const u32 ro = (u32)(vepc->bar0_size - 1);
+
+	state->val = (val & ~ro) | (BAR0_TYPE & ro);
+}
+
+static void bar0_write_hi(struct vepc_dev *vepc, struct reg_entry *self,
+			    struct reg_state *state, u32 val)
+{
+	const u32 ro = (u32)((vepc->bar0_size - 1) >> 32);
+
+	state->val = val & ~ro;
+}
+
+static void command_write(struct vepc_dev *vnvme, struct reg_entry *self,
+			  struct reg_state *state, u32 val)
+{
+	const u32 old = state->val;
+	const u32 changed = old ^ val;
+
+	if (changed & PCI_COMMAND_MASTER)
+	{
+		if(val & PCI_COMMAND_MASTER)
+			pr_info("BME ON\n");
+		else
+			pr_info("BME OFF\n");
+
+	}
+
+	if (changed & PCI_COMMAND_MEMORY)
+	{
+		if(val & PCI_COMMAND_MEMORY)
+			pr_info("MSE ON\n");
+		else
+			pr_info("MSE OFF\n");
+	}
+
+	state->val = val;
+}
+
+static void pmcsr_write(struct vepc_dev *vepc, struct reg_entry *self,
+			struct reg_state *state, u32 val)
+{
+	const u32 old_ps = state->val & PCI_PM_CTRL_STATE_MASK; /* bits [1:0], still pre-write */
+	const u32 new_ps = val & PCI_PM_CTRL_STATE_MASK;        /* val already ro/rw1c-filtered by reg.c */
+
+	if (new_ps == 0x3 && old_ps != 0x3)
+		pr_info("D3Hot ON\n");
+	else if(new_ps == 0x0 && old_ps == 0x3)
+		pr_info("D3Hot OFF\n");
+
+	state->val = val;
+}
+
+static u32 ep_did_read(struct vepc_dev *vepc, struct reg_entry *self,
+		    struct reg_state *state)
+{
+	return vepc->ep_did;
+}
+
+static u32 ep_vid_read(struct vepc_dev *vepc, struct reg_entry *self,
+		    struct reg_state *state)
+{
+	return vepc->ep_vid;
+}
+
+const struct reg_entry ep_regs_layout[] = {
+/* ---- Type 0 header, PCI-compatible region (0x00-0x3F) */
+
+/* Vendor ID */
+   { .offset = 0x00, .size = 2, .ro_mask = 0xFFFF, .read_handler = ep_vid_read },
+/* Device ID */
+   { .offset = 0x02, .size = 2, .ro_mask = 0xFFFF, .read_handler = ep_did_read },
+/* Command */
+   { .offset = 0x04, .size = 2, .ro_mask = 0xFAB9, .write_handler = command_write },
+/* Status  */
+   { .offset = 0x06, .size = 2, .default_val = 0x0010, .ro_mask = 0x06FF,
+.rw1c_mask = 0xF900 },
+/* Revision ID  */
+   { .offset = 0x08, .size = 1, .default_val = 0x01, .ro_mask = 0xFF },
+/* Programing Interface */
+   { .offset = 0x09, .size = 1, .default_val = 0x02, .ro_mask = 0xFF },
+/* Sub-Class  */
+   { .offset = 0x0A, .size = 1, .default_val = 0x08, .ro_mask = 0xFF },
+/* Base Class */
+   { .offset = 0x0B, .size = 1, .default_val = 0x01, .ro_mask = 0xFF },
+/* Cache Line Size */
+   { .offset = 0x0C, .size = 1 },
+/* Latency Timer */
+   { .offset = 0x0D, .size = 1, .ro_mask = 0xFF },
+/* Header Type */
+   { .offset = 0x0E, .size = 1, .default_val = 0x00, .ro_mask = 0xFF },
+/* BIST */
+   { .offset = 0x0F, .size = 1, .ro_mask = 0xFF },
+/* BAR0 - special case, dedicated write handler overrides all masks */
+   { .offset = 0x10, .size = 4, .default_val = BAR0_TYPE, .write_handler = bar0_write_lo},
+/* BAR1 - special case, dedicated write handler overrides all masks */
+   { .offset = 0x14, .size = 4, .write_handler = bar0_write_hi },
+/* BAR2 */
+   { .offset = 0x18, .size = 4, .ro_mask = 0xFFFFFFFFu },
+/* BAR3 */
+   { .offset = 0x1C, .size = 4, .ro_mask = 0xFFFFFFFFu },
+/* BAR4 */
+   { .offset = 0x20, .size = 4, .ro_mask = 0xFFFFFFFFu },
+/* BAR5 */
+   { .offset = 0x24, .size = 4, .ro_mask = 0xFFFFFFFFu },
+/* Cardbus CIS Pointer */
+   { .offset = 0x28, .size = 4, .ro_mask = 0xFFFFFFFFu },
+/* Subsystem Vendor ID */
+   { .offset = 0x2C, .size = 2, .ro_mask = 0xFFFF, .read_handler = ep_vid_read },
+/* Subsystem ID */
+   { .offset = 0x2E, .size = 2, .ro_mask = 0xFFFF, .read_handler = ep_did_read },
+/* Expansion ROM Base Address */
+   { .offset = 0x30, .size = 4, .ro_mask = 0xFFFFFFFFu },
+/* Capabilities Pointer */
+   { .offset = 0x34, .size = 4, .default_val = 0x00000040u, .ro_mask = 0xFFFFFFFFu },
+/* Reserved */
+   { .offset = 0x38, .size = 4, .ro_mask = 0xFFFFFFFFu },
+/* Interrupt Line */
+   {  .offset = 0x3C, .size = 1 },
+/* Interrupt Pin - no legacy INTx */
+   {  .offset = 0x3D, .size = 1, .default_val = 0x00, .ro_mask = 0xFF },
+/* Min_Gnt */
+   {  .offset = 0x3E, .size = 1, .ro_mask = 0xFF },
+/* Max_Lat */
+   {  .offset = 0x3F, .size = 1, .ro_mask = 0xFF },
+
+/* ---- PCI Power Management Capability  */
+/* Required for all PCI Express Functions */
+
+/* Power Management Capabilities (PMC) */
+   {  .offset = 0x40, .size = 4, .default_val = 0x00035001u, .ro_mask = 0xFFFFFFFFu },
+/* Power Management Control/Status (PMCSR) */
+   {  .offset = 0x44, .size = 4, .ro_mask = 0xFFFF60FCu, .rw1c_mask = 0x00008000u, .write_handler = pmcsr_write },
+
+/* MSI-X Capability */
+
+/* MSI-X Message Control + Capability Header (table size = 17 (16 IO + 1 admin)) */
+   {  .offset = 0x50, .size = 4, .default_val = 0x00106011u, .ro_mask = 0x3FFFFFFFu },
+/* MSI-X Table Offset / Table BIR */
+   {  .offset = 0x54, .size = 4, .default_val = 0x00002000u, .ro_mask = 0xFFFFFFFFu },
+/* MSI-X PBA Offset / PBA BIR */
+   {  .offset = 0x58, .size = 4, .default_val = 0x00003000u, .ro_mask = 0xFFFFFFFFu },
+
+/* ---- PCI Express Capability */
+
+/* PCI Express Capability List */
+   {  .offset = 0x60, .size = 2, .default_val = 0x0010, .ro_mask = 0xFFFF },
+/* PCI Express Capabilities Register */
+   {  .offset = 0x62, .size = 2, .default_val = 0x0002, .ro_mask = 0xFFFF },
+/* Device Capabilities */
+   {  .offset = 0x64, .size = 4, .default_val = 0x00008001u, .ro_mask = 0xFFFFFFFFu },
+/* Device Control + Device Status */
+   {  .offset = 0x68, .size = 4, .rw1c_mask = 0x000F0000u, .ro_mask = 0x00200000u },
+/* Link Capabilities */
+   {  .offset = 0x6C, .size = 4, .default_val = 0x00000045u, .ro_mask = 0xFFFFFFFFu },
+/* Link Control + Link Status */
+   {  .offset = 0x70, .size = 4, .default_val = 0x00450000u, .ro_mask = 0xFFFF0000u },
+/* Device Capabilities 2 */
+   {  .offset = 0x74, .size = 4, .ro_mask = 0xFFFFFFFFu },
+/* Device Control 2 + Device Status 2 */
+   {  .offset = 0x78, .size = 4, .ro_mask = 0xFFFF0000u },
+/* Link Capabilities 2 */
+   {  .offset = 0x7C, .size = 4, .default_val = 0x0000003Eu, .ro_mask = 0xFFFFFFFFu },
+/* Link Control 2 + Link Status 2 */
+   {  .offset = 0x80, .size = 4, .ro_mask = 0xFFFF0000u },
+
+/* ---- AER Extended Capability */
+
+/* AER Extended Capability Header */
+   {  .offset = 0x100, .size = 4, .default_val = 0x15010001u, .ro_mask = 0xFFFFFFFFu },
+/* Uncorrectable Error Status */
+   {  .offset = 0x104, .size = 4, .rw1c_mask = 0x03FF7030u, .sticky_mask = 0x03FF7030u },
+/* Uncorrectable Error Mask */
+   {  .offset = 0x108, .size = 4, .sticky_mask = 0x03FF7030u },
+/* Uncorrectable Error Severity */
+   {  .offset = 0x10C, .size = 4, .sticky_mask = 0x03FF7030u },
+/* Correctable Error Status */
+   {  .offset = 0x110, .size = 4, .rw1c_mask = 0x0000F1C1u, .sticky_mask = 0x0000F1C1u },
+/* Correctable Error Mask */
+   {  .offset = 0x114, .size = 4, .sticky_mask = 0x0000F1C1u },
+/* Advanced Error Capabilities and Control */
+   {  .offset = 0x118, .size = 4, .ro_mask = 0xFFFFFFFFu },
+/* Header Log DW0 */
+   {  .offset = 0x11C, .size = 4, .ro_mask = 0xFFFFFFFFu },
+/* Header Log DW1 */
+   {  .offset = 0x120, .size = 4, .ro_mask = 0xFFFFFFFFu },
+/* Header Log DW2 */
+   {  .offset = 0x124, .size = 4, .ro_mask = 0xFFFFFFFFu },
+/* Header Log DW3 */
+   {  .offset = 0x128, .size = 4, .ro_mask = 0xFFFFFFFFu },
+
+/* ---- Secondary PCI Express Extended Capability */
+
+/* Secondary PCI Express Extended Capability Header */
+   {  .offset = 0x150, .size = 4, .default_val = 0x18010019u, .ro_mask = 0xFFFFFFFFu },
+/* Link Control 3 Register */
+   {  .offset = 0x154, .size = 4, .ro_mask = 0xFFFFFFFFu },
+/* Lane Error Status Register */
+   {  .offset = 0x158, .size = 4, .rw1c_mask = 0x0000000Fu,
+      .sticky_mask = 0x0000000Fu, .ro_mask = 0xFFFFFFF0u },
+/* Lane Equalization Control - Lanes 0,1 */
+   {  .offset = 0x15C, .size = 4, .ro_mask = 0xFFFFFFFFu },
+/* Lane Equalization Control - Lanes 2,3 */
+   {  .offset = 0x160, .size = 4, .ro_mask = 0xFFFFFFFFu },
+
+/* ---- Physical Layer 16.0 GT/s Extended Capability */
+
+/* Physical Layer 16.0 GT/s Extended Capability Header */
+   {  .offset = 0x180, .size = 4, .default_val = 0x1B010026u, .ro_mask = 0xFFFFFFFFu },
+/* 16.0 GT/s Capabilities Register */
+   {  .offset = 0x184, .size = 4, .ro_mask = 0xFFFFFFFFu },
+/* 16.0 GT/s Control Register */
+   {  .offset = 0x188, .size = 4, .ro_mask = 0xFFFFFFFFu },
+/* 16.0 GT/s Status Register */
+   {  .offset = 0x18C, .size = 4, .rw1c_mask = 0x00000010u,
+      .sticky_mask = 0x00000010u, .ro_mask = 0xFFFFFFEFu },
+/* 16.0 GT/s Local Data Parity Mismatch Status */
+   {  .offset = 0x190, .size = 4, .rw1c_mask = 0x0000000Fu,
+      .sticky_mask = 0x0000000Fu, .ro_mask = 0xFFFFFFF0u },
+/* 16.0 GT/s First Retimer Data Parity Mismatch Status */
+   {  .offset = 0x194, .size = 4, .rw1c_mask = 0x0000000Fu,
+      .sticky_mask = 0x0000000Fu, .ro_mask = 0xFFFFFFF0u },
+/* 16.0 GT/s Second Retimer Data Parity Mismatch Status */
+   {  .offset = 0x198, .size = 4, .rw1c_mask = 0x0000000Fu,
+      .sticky_mask = 0x0000000Fu, .ro_mask = 0xFFFFFFF0u },
+/* Physical Layer 16.0 GT/s Reserved */
+   {  .offset = 0x19C, .size = 4, .ro_mask = 0xFFFFFFFFu },
+/* 16.0 GT/s Lane Equalization Control Register */
+   {  .offset = 0x1A0, .size = 4, .ro_mask = 0xFFFFFFFFu },
+
+/* ---- Physical Layer 32.0 GT/s Extended Capability */
+
+/* Physical Layer 32.0 GT/s Extended Capability Header */
+   {  .offset = 0x1B0, .size = 4, .default_val = 0x1E01002Au, .ro_mask = 0xFFFFFFFFu },
+/* 32.0 GT/s Capabilities Register */
+   {  .offset = 0x1B4, .size = 4, .default_val = 0x00000101u, .ro_mask = 0xFFFFFFFFu },
+/* 32.0 GT/s Control Register */
+   {  .offset = 0x1B8, .size = 4, .ro_mask = 0xFFFFFFFEu },
+/* 32.0 GT/s Status Register */
+   {  .offset = 0x1BC, .size = 4, .rw1c_mask = 0x00000010u,
+      .sticky_mask = 0x00000010u, .ro_mask = 0xFFFFFFEFu },
+/* Received Modified TS Data 1 */
+   {  .offset = 0x1C0, .size = 4, .ro_mask = 0xFFFFFFFFu },
+/* Received Modified TS Data 2 */
+   {  .offset = 0x1C4, .size = 4, .ro_mask = 0xFFFFFFFFu },
+/* Transmitted Modified TS Data 1 */
+   {  .offset = 0x1C8, .size = 4, .ro_mask = 0xFFFFFFFFu },
+/* Transmitted Modified TS Data 2 */
+   {  .offset = 0x1CC, .size = 4, .ro_mask = 0xFFFFFFFFu },
+/* 32.0 GT/s Lane Equalization Control Register */
+   {  .offset = 0x1D0, .size = 4, .ro_mask = 0xFFFFFFFFu },
+
+/* ---- Lane Margining at the Receiver Extended Capability */
+
+/* Lane Margining Extended Capability Header */
+   {  .offset = 0x1E0, .size = 4, .default_val = 0x00010027u, .ro_mask = 0xFFFFFFFFu },
+/* Margining Port Capabilities + Margining Port Status */
+   {  .offset = 0x1E4, .size = 4, .ro_mask = 0xFFFFFFFFu },
+/* Margining Lane Control/Status - Lane 0 */
+   {  .offset = 0x1E8, .size = 4, .default_val = 0x00009C38u, .ro_mask = 0xFFFF0080u },
+/* Margining Lane Control/Status - Lane 1 */
+   {  .offset = 0x1EC, .size = 4, .default_val = 0x00009C38u, .ro_mask = 0xFFFF0080u },
+/* Margining Lane Control/Status - Lane 2 */
+   {  .offset = 0x1F0, .size = 4, .default_val = 0x00009C38u, .ro_mask = 0xFFFF0080u },
+/* Margining Lane Control/Status - Lane 3 */
+   {  .offset = 0x1F4, .size = 4, .default_val = 0x00009C38u, .ro_mask = 0xFFFF0080u },
+};
+const size_t ep_regs_layout_size = ARRAY_SIZE(ep_regs_layout);
+
 static int pci_read(struct pci_bus *bus, unsigned int devfn, int where, int size, u32 *val)
 {
 	struct vepc_dev *vepc = container_of(bus->sysdata, struct vepc_dev, sysdata);
@@ -480,6 +760,7 @@ static ssize_t vepc_cfg_enable_store(struct config_item *item, const char *page,
 	else
 	{
 		pr_info("disabling...\n");
+		ep_hotremove(vepc_dev);
 		rc_hotremove(vepc_dev);
 	}
 	mutex_unlock(&cfg_lock);
@@ -839,6 +1120,11 @@ destroy_regs:
 static int rc_exit(struct vepc_dev *vepc)
 {
 	bus_unregister_notifier(&pci_bus_type, &vepc->pci_nb);
+	if(vepc->bridge)
+	{
+		pci_stop_root_bus(vepc->bridge->bus);
+		pci_remove_root_bus(vepc->bridge->bus);
+	}
 	msi_domain_destroy(vepc);
 	if(vepc->sysdata.domain)
 		pci_bus_release_emul_domain_nr(vepc->sysdata.domain);
@@ -1100,6 +1386,31 @@ static int rc_reset(enum reset_type reset, struct vepc_dev *vepc)
 		pr_err("Not supported reset!\n");
 		return -EINVAL;
 	}
+	return 0;
+}
+
+static int ep_init(struct vepc_dev *vepc)
+{
+	return 0;
+}
+
+static int ep_exit(struct vepc_dev *vepc)
+{
+	return 0;
+}
+
+static int ep_hotplug(struct vepc_dev *vepc)
+{
+	return 0;
+}
+
+static int ep_hotremove(struct vepc_dev *vepc)
+{
+	return 0;
+}
+
+static int ep_reset(enum reset_type reset, struct vepc_dev *vepc)
+{
 	return 0;
 }
 
