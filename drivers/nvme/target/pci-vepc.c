@@ -636,6 +636,15 @@ static struct pci_ops pci_ops = {
 };
 
 /* ----   config fs ----*/
+static DEFINE_MUTEX(cfg_lock);
+
+static u16 rc_vid;
+static u16 rc_did;
+static u16 ep_vid;
+static u16 ep_did;
+static u64 bar0_phys;
+static u32 bar0_size;
+
 static ssize_t vepc_cfg_hotplug_store(struct config_item *item, const char *page, size_t len)
 {
 	bool plug;
@@ -645,6 +654,10 @@ static ssize_t vepc_cfg_hotplug_store(struct config_item *item, const char *page
 		return -EINVAL;
 
 	pr_info("hotplug requested!\n");
+
+	mutex_lock(&cfg_lock);
+	ep_hotplug(vepc_dev);
+	mutex_unlock(&cfg_lock);
 
 	return len;
 }
@@ -660,18 +673,14 @@ static ssize_t vepc_cfg_hotremove_store(struct config_item *item, const char *pa
 
 	pr_info("hotremoval requested!\n");
 
+	mutex_lock(&cfg_lock);
+	ep_hotremove(vepc_dev);
+	mutex_unlock(&cfg_lock);
+
 	return len;
 }
 CONFIGFS_ATTR_WO(vepc_cfg_, hotremove);
 
-
-static DEFINE_MUTEX(cfg_lock);
-static u16 rc_vid;
-static u16 rc_did;
-static u16 ep_vid;
-static u16 ep_did;
-static u64 bar0_phys;
-static u32 bar0_size;
 
 static bool verify_pids_vids(void)
 {
@@ -1127,14 +1136,17 @@ static int rc_exit(struct vepc_dev *vepc)
 	}
 	msi_domain_destroy(vepc);
 	if(vepc->sysdata.domain)
-		pci_bus_release_emul_domain_nr(vepc->sysdata.domain);
-	if(vepc->bridge)
 	{
-		pci_free_resource_list(&vepc->bridge->windows);
+		pci_bus_release_emul_domain_nr(vepc->sysdata.domain);
+		vepc->sysdata.domain = 0x0;
+	}
+
+	if(vepc->plat_dev)
+	{
+		platform_device_unregister(vepc->plat_dev);
+		vepc->plat_dev = NULL;
 		vepc->bridge = NULL;
 	}
-	platform_device_unregister(vepc->plat_dev);
-	vepc->plat_dev = NULL;
 	reg_space_destroy(&vepc->rc_regs);
 	return 0;
 }
@@ -1391,26 +1403,94 @@ static int rc_reset(enum reset_type reset, struct vepc_dev *vepc)
 
 static int ep_init(struct vepc_dev *vepc)
 {
+	int rc = reg_space_init(&vepc->ep_regs, ep_regs_layout, ep_regs_layout_size);
+	if(rc)
+	{
+		pr_err("reg_space_init() failed: %d\n", rc);
+		return -ENOMEM;
+	}
+	vepc->ep_regs.dev = vepc;
+
+	vepc->bar0_virt = ioremap(vepc->bar0_phys, vepc->bar0_size);
+	if(!vepc->bar0_virt)
+	{
+		pr_err("ioremap failed!\n");
+		rc = -EPERM;	//TODO: find a better error code
+		goto reg_destroy;
+	}
+	memset_io(vepc->bar0_virt, 0, vepc->bar0_size);
+
+	ep_reset(RESET_POWER_ON, vepc);
 	return 0;
+
+reg_destroy:
+	reg_space_destroy(&vepc->ep_regs);
+	return rc;
 }
 
 static int ep_exit(struct vepc_dev *vepc)
 {
+	int rc = reg_space_destroy(&vepc->ep_regs);
+	if(rc)
+		pr_err("reg_space_destroy() failed: %d\n", rc);
+	if(vepc->bar0_virt)
+		iounmap(vepc->bar0_virt);
+
 	return 0;
 }
 
 static int ep_hotplug(struct vepc_dev *vepc)
 {
+	int rc = ep_init(vepc);
+	if(rc)
+	{
+		pr_err("ep_init() failed\n");
+		return rc;
+	}
+	
+	clear_access_filter(vepc, ACC_F_EP_UR);
+
+	u32 link;
+	rc_reg_read(vepc, 0x52, 2, &link);	//TODO: rc check
+	link |= PCI_EXP_LNKSTA_DLLLA;
+	reg_write_direct(&vepc->rc_regs, 0x52, 2, link);
+
+	u32 slot;
+	rc_reg_read(vepc, 0x54, 2, &slot);
+	slot |= PCI_EXP_SLTSTA_PDS | PCI_EXP_SLTSTA_PDC | PCI_EXP_SLTSTA_DLLSC;
+	reg_write_direct(&vepc->rc_regs, 0x54, 2, slot);
+
+	pci_lock_rescan_remove();
+	pci_rescan_bus(vepc->bridge->bus);
+	pci_unlock_rescan_remove();
+
+	msi_hotplug_irq(vepc);
 	return 0;
 }
 
 static int ep_hotremove(struct vepc_dev *vepc)
 {
-	return 0;
+	return ep_exit(vepc);
 }
 
 static int ep_reset(enum reset_type reset, struct vepc_dev *vepc)
 {
+	switch(reset)
+	{
+	case RESET_POWER_ON:
+		reg_set_default_values(&vepc->ep_regs);
+		break;
+		/*
+	case RESET_PCIE_LINK_RESET:
+		break;
+	case RESET_PCIE_FUNCTION_RESET:
+		break;
+		*/
+	default:
+		pr_err("Not supported yet!\n");
+		return -EINVAL;
+		break;
+	}
 	return 0;
 }
 
