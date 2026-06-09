@@ -911,8 +911,59 @@ static u32 reg_filter_write(const struct reg_state *state, u32 access_start,
 	return new;
 }
 
+/*
+ * validate provided reg space.
+ * - check if size is 1,2,4
+ * - natural alignment by the PCIe spec (offset % size == 0)
+ * - acending + non-overlap - otherwise reg_find_first() will fail
+ */
+static int reg_space_validate(const struct reg_entry *entries, size_t n_entries)
+{
+	size_t i;
+
+	for (i = 0; i < n_entries; ++i) {
+		const struct reg_entry *e = &entries[i];
+
+		if (e->size != 1 && e->size != 2 && e->size != 4) {
+			pr_err("reg entry %zu (offset 0x%x) has invalid size %u\n",
+			       i, (u32)e->offset, e->size);
+			return -EINVAL;
+		}
+
+		if ((u32)e->offset % e->size != 0) {
+			pr_err("reg entry %zu (offset 0x%x) not naturally aligned to size %u\n",
+			       i, (u32)e->offset, e->size);
+			return -EINVAL;
+		}
+
+		if (i > 0) {
+			const u32 prev_end =
+				(u32)entries[i - 1].offset + entries[i - 1].size;
+
+			if ((u32)e->offset < prev_end) {
+				pr_err("reg entry %zu (offset 0x%x) not ascending / overlaps previous (prev_end 0x%x)\n",
+				       i, (u32)e->offset, prev_end);
+				return -EINVAL;
+			}
+		}
+	}
+
+	return 0;
+}
+
 static int reg_space_init(struct reg_space *space, const struct reg_entry *entries, size_t n_entries)
 {
+	if (reg_space_validate(entries, n_entries))
+		return -EINVAL;
+
+	space->states = kcalloc(n_entries, sizeof(*space->states), GFP_KERNEL);
+	if (!space->states)
+		return -ENOMEM;
+
+	space->entries = entries;
+	space->n_entries = n_entries;
+
+	reg_set_default_values(space);
 
 	return 0;
 }
