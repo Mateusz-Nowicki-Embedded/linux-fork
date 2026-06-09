@@ -318,6 +318,8 @@ static int pci_read(struct pci_bus *bus, unsigned int devfn, int where, int size
 	struct vepc_dev *vepc = container_of(bus->sysdata, struct vepc_dev, sysdata);
 	*val = 0xFFFFFF; //TODO: better define needed
 	
+	pr_info("read bus: where: 0x%x, where: 0x%x, size: 0x%x\n", bus->number, where, size);
+
 	if(size != 1 && size != 2 && size != 4)
 		return PCIBIOS_BAD_REGISTER_NUMBER;	//support only 1,2,4
 
@@ -387,9 +389,9 @@ CONFIGFS_ATTR_WO(vepc_cfg_, hotremove);
 
 static DEFINE_MUTEX(cfg_lock);
 static u16 rc_vid;
-static u16 rc_pid;
+static u16 rc_did;
 static u16 ep_vid;
-static u16 ep_pid;
+static u16 ep_did;
 static u64 bar0_phys;
 static u32 bar0_size;
 
@@ -401,9 +403,9 @@ static bool verify_pids_vids(void)
 		return false;
 	}
 
-	if(!rc_pid)
+	if(!rc_did)
 	{
-		pr_err("rc_pid is empty!\n");
+		pr_err("rc_did is empty!\n");
 		return false;
 	}
 	if(!ep_vid)
@@ -411,9 +413,9 @@ static bool verify_pids_vids(void)
 		pr_err("ep_vid is empty!\n");
 		return false;
 	}
-	if(!ep_pid)
+	if(!ep_did)
 	{
-		pr_err("ep_pid is empty!\n");
+		pr_err("ep_did is empty!\n");
 		return false;
 	}
 	
@@ -507,17 +509,17 @@ static ssize_t vepc_cfg_rc_vid_store(struct config_item *item, const char *page,
 }
 CONFIGFS_ATTR(vepc_cfg_, rc_vid);
 
-static ssize_t vepc_cfg_rc_pid_show(struct config_item *item, char *page)
+static ssize_t vepc_cfg_rc_did_show(struct config_item *item, char *page)
 {
 	ssize_t ret;
 	mutex_lock(&cfg_lock);
-	ret = sysfs_emit(page, "0x%x\n", rc_pid);
+	ret = sysfs_emit(page, "0x%x\n", rc_did);
 	mutex_unlock(&cfg_lock);
 
 	return ret;
 }
 
-static ssize_t vepc_cfg_rc_pid_store(struct config_item *item, const char *page, size_t len)
+static ssize_t vepc_cfg_rc_did_store(struct config_item *item, const char *page, size_t len)
 {
 	u16 pid;
 	if(!len)
@@ -526,12 +528,12 @@ static ssize_t vepc_cfg_rc_pid_store(struct config_item *item, const char *page,
 		return -EINVAL;
 
 	mutex_lock(&cfg_lock);
-	rc_pid = pid;
+	rc_did = pid;
 	mutex_unlock(&cfg_lock);
 
 	return len;
 }
-CONFIGFS_ATTR(vepc_cfg_, rc_pid);
+CONFIGFS_ATTR(vepc_cfg_, rc_did);
 
 static ssize_t vepc_cfg_ep_vid_show(struct config_item *item, char *page)
 {
@@ -559,17 +561,17 @@ static ssize_t vepc_cfg_ep_vid_store(struct config_item *item, const char *page,
 }
 CONFIGFS_ATTR(vepc_cfg_, ep_vid);
 
-static ssize_t vepc_cfg_ep_pid_show(struct config_item *item, char *page)
+static ssize_t vepc_cfg_ep_did_show(struct config_item *item, char *page)
 {
 	ssize_t ret;
 	mutex_lock(&cfg_lock);
-	ret = sysfs_emit(page, "0x%x\n", ep_pid);
+	ret = sysfs_emit(page, "0x%x\n", ep_did);
 	mutex_unlock(&cfg_lock);
 
 	return ret;
 }
 
-static ssize_t vepc_cfg_ep_pid_store(struct config_item *item, const char *page, size_t len)
+static ssize_t vepc_cfg_ep_did_store(struct config_item *item, const char *page, size_t len)
 {
 	u16 pid;
 	if(!len)
@@ -578,12 +580,12 @@ static ssize_t vepc_cfg_ep_pid_store(struct config_item *item, const char *page,
 		return -EINVAL;
 
 	mutex_lock(&cfg_lock);
-	ep_pid = pid;
+	ep_did = pid;
 	mutex_unlock(&cfg_lock);
 
 	return len;
 }
-CONFIGFS_ATTR(vepc_cfg_, ep_pid);
+CONFIGFS_ATTR(vepc_cfg_, ep_did);
 
 static ssize_t vepc_cfg_bar0_phys_show(struct config_item *item, char *page)
 {
@@ -642,9 +644,9 @@ static struct configfs_attribute *vepc_cfg_attrs[] = {
 	&vepc_cfg_attr_hotremove,
 	&vepc_cfg_attr_enable,
 	&vepc_cfg_attr_rc_vid,
-	&vepc_cfg_attr_rc_pid,
+	&vepc_cfg_attr_rc_did,
 	&vepc_cfg_attr_ep_vid,
-	&vepc_cfg_attr_ep_pid,
+	&vepc_cfg_attr_ep_did,
 	&vepc_cfg_attr_bar0_phys,
 	&vepc_cfg_attr_bar0_size,
 	NULL
