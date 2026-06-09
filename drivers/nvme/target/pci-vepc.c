@@ -121,9 +121,6 @@ static int bus_notify(struct notifier_block *nb, unsigned long action, void *dat
 static void patch_resources(struct vepc_dev *vepc, struct pci_dev *pdev);
 
 
-/* 1MiB-aligned helper */
-#define RC_MEM_BASE(phys) ((phys) & ~((1ULL << 20) - 1))
-#define RC_MEM_LIMIT(phys) (RC_MEM_BASE(phys) + (1ULL << 20) - 1)
 
 static u32 did_read(struct vepc_dev *vepc, struct reg_entry *self,
 		    struct reg_state *state)
@@ -358,6 +355,7 @@ static struct pci_ops pci_ops = {
 	.write = pci_write,
 };
 
+/* ----   config fs ----*/
 static ssize_t vepc_cfg_hotplug_store(struct config_item *item, const char *page, size_t len)
 {
 	bool plug;
@@ -453,20 +451,24 @@ static ssize_t vepc_cfg_enable_store(struct config_item *item, const char *page,
 	if(kstrtobool(page, &enable))
 		return -EINVAL;
 
-	mutex_lock(&cfg_lock);
 	pr_info("enable = %d!\n", enable);
+	mutex_lock(&cfg_lock);
 	if(enable)
 	{
-		if(!verify_pids_vids())
+		if(!verify_pids_vids() || !verify_bar0())
+		{
+			mutex_unlock(&cfg_lock);
 			return -EINVAL;
-		if(!verify_bar0())
-			return -EINVAL;
+		}
 
 		//enable controller
 		pr_info("enabling...\n");
 		int rc = rc_hotplug(vepc_dev);
 		if(rc)
+		{
+			mutex_unlock(&cfg_lock);
 			return rc;
+		}
 	}
 	else
 	{
@@ -663,7 +665,7 @@ static struct configfs_subsystem vepc_cfg_subsys = {
 	.su_mutex = __MUTEX_INITIALIZER(vepc_cfg_subsys.su_mutex),
 };
 
-
+/* ----   INIT ---- */
 static int __init vepc_init_module(void)
 {
 	int rc;
@@ -697,6 +699,10 @@ static void __exit vepc_exit_module(void)
 		configfs_unregister_subsystem(&vepc_cfg_subsys);
 	}
 }
+
+/* 1MiB-aligned helper */
+#define RC_MEM_BASE(phys) ((phys) & ~((1ULL << 20) - 1))
+#define RC_MEM_LIMIT(phys) (RC_MEM_BASE(phys) + (1ULL << 20) - 1)
 
 static int rc_init(struct vepc_dev *vepc)
 {
