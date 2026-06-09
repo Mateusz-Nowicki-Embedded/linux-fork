@@ -653,8 +653,10 @@ static ssize_t vepc_cfg_hotplug_store(struct config_item *item, const char *page
 	if(!plug)
 		return -EINVAL;
 
-	pr_info("hotplug requested!\n");
+	if(vepc_dev->bar0_virt)
+		return -EPERM;
 
+	pr_info("hotplug requested!\n");
 	mutex_lock(&cfg_lock);
 	ep_hotplug(vepc_dev);
 	mutex_unlock(&cfg_lock);
@@ -670,6 +672,9 @@ static ssize_t vepc_cfg_hotremove_store(struct config_item *item, const char *pa
 		return -EINVAL;
 	if(!remove)
 		return -EINVAL;
+
+	if(!vepc_dev->bar0_virt)
+		return -EPERM;
 
 	pr_info("hotremoval requested!\n");
 
@@ -1448,7 +1453,10 @@ static int ep_exit(struct vepc_dev *vepc)
 	if(rc)
 		pr_err("reg_space_destroy() failed: %d\n", rc);
 	if(vepc->bar0_virt)
+	{
 		iounmap(vepc->bar0_virt);
+		vepc->bar0_virt = NULL;
+	}
 
 	return 0;
 }
