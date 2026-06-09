@@ -318,8 +318,6 @@ static int pci_read(struct pci_bus *bus, unsigned int devfn, int where, int size
 	struct vepc_dev *vepc = container_of(bus->sysdata, struct vepc_dev, sysdata);
 	*val = 0xFFFFFF; //TODO: better define needed
 	
-	pr_info("read bus: 0x%x, devfn: 0x%x,  where: 0x%x, size: 0x%x\n", bus->number, devfn, where, size);
-
 	if(size != 1 && size != 2 && size != 4)
 		return PCIBIOS_BAD_REGISTER_NUMBER;	//support only 1,2,4
 
@@ -1030,7 +1028,6 @@ static int reg_read(struct reg_space *space, u32 offset, u32 size, u32 *val)
 				 reg_base, e->size, cur);
 	}
 
-	pr_info("reg_read() val = 0x%x\n", *val);
 	*val = result;
 	return PCIBIOS_SUCCESSFUL;
 }
@@ -1131,7 +1128,6 @@ static int ep_reg_write(struct vepc_dev *vepc, int where, int size, u32 val)
 
 static int rc_reg_read(struct vepc_dev *vepc, int where, int size, u32 *val)
 {
-	pr_info("rc_reg_read()\n");
 	if(vepc->access_filter & ACC_F_RC_UR)
 	{
 		*val = 0xFFFFFFFF;
