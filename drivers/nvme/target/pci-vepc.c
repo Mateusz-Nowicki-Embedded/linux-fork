@@ -744,6 +744,13 @@ static ssize_t vepc_cfg_enable_store(struct config_item *item, const char *page,
 	mutex_lock(&cfg_lock);
 	if(enable)
 	{
+		if(vepc_dev->bridge)
+		{
+			pr_info("already enabled\n");
+			mutex_unlock(&cfg_lock);
+			return -EPERM;
+		}
+
 		if(!verify_pids_vids() || !verify_bar0())
 		{
 			mutex_unlock(&cfg_lock);
@@ -768,6 +775,13 @@ static ssize_t vepc_cfg_enable_store(struct config_item *item, const char *page,
 	}
 	else
 	{
+		if(!vepc_dev->bridge)
+		{
+			pr_info("already disabled\n");
+			mutex_unlock(&cfg_lock);
+			return -EPERM;
+		}
+
 		pr_info("disabling...\n");
 		ep_hotremove(vepc_dev);
 		rc_hotremove(vepc_dev);
@@ -1145,8 +1159,8 @@ static int rc_exit(struct vepc_dev *vepc)
 	{
 		platform_device_unregister(vepc->plat_dev);
 		vepc->plat_dev = NULL;
-		vepc->bridge = NULL;
 	}
+	vepc->bridge = NULL;
 	reg_space_destroy(&vepc->rc_regs);
 	return 0;
 }
@@ -1470,7 +1484,35 @@ static int ep_hotplug(struct vepc_dev *vepc)
 
 static int ep_hotremove(struct vepc_dev *vepc)
 {
-	return ep_exit(vepc);
+	struct pci_dev *rp = pci_get_slot(vepc->bridge->bus, PCI_DEVFN(0,0));
+	struct pci_bus *bus1 = rp ? rp->subordinate : NULL;
+	
+	set_access_filter(vepc, ACC_F_EP_UR);
+
+	struct pci_dev *ep = bus1 ? pci_get_slot(bus1, PCI_DEVFN(0,0)) : NULL;
+	if(ep)
+	{
+		WRITE_ONCE(ep->error_state, pci_channel_io_perm_failure); //hack to drop io instantly
+		pci_stop_and_remove_bus_device_locked(ep);
+		pci_dev_put(ep);
+	}
+	pci_dev_put(rp);
+
+	u32 link;
+	rc_reg_read(vepc, 0x52, 2, &link);	//TODO: rc check
+	link &= ~(PCI_EXP_LNKSTA_DLLLA);
+	reg_write_direct(&vepc->rc_regs, 0x52, 2, link);
+
+	u32 slot;
+	rc_reg_read(vepc, 0x54, 2, &slot);
+	slot &= ~(PCI_EXP_SLTSTA_PDS);
+	slot |= PCI_EXP_SLTSTA_PDC | PCI_EXP_SLTSTA_DLLSC;
+	reg_write_direct(&vepc->rc_regs, 0x54, 2, slot);
+
+	ep_exit(vepc);
+
+	msi_hotplug_irq(vepc);
+	return 0;
 }
 
 static int ep_reset(enum reset_type reset, struct vepc_dev *vepc)
