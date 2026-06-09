@@ -327,9 +327,9 @@ static int pci_read(struct pci_bus *bus, unsigned int devfn, int where, int size
 		return PCIBIOS_DEVICE_NOT_FOUND;
 
 	if(bus->number == 0)
-		rc_reg_read(vepc, where, size, val);
+		return rc_reg_read(vepc, where, size, val);
 	else if(bus->number == 1)
-		ep_reg_read(vepc, where, size, val);
+		return ep_reg_read(vepc, where, size, val);
 	
 	return PCIBIOS_DEVICE_NOT_FOUND;
 }
@@ -795,13 +795,18 @@ static int rc_init(struct vepc_dev *vepc)
 	set_access_filter(vepc, ACC_F_EP_UR);	//Don't allow endpoint enumeration
 	
 	vepc->pci_nb.notifier_call = bus_notify;
-	bus_register_notifier(&pci_bus_type, &vepc->pci_nb);
+	rc = bus_register_notifier(&pci_bus_type, &vepc->pci_nb);
+	if(rc)
+	{
+		pr_err("bus_register_notifier() failed: %d\n", rc);
+		goto destroy_msi;
+	}
 
 	rc = pci_scan_root_bus_bridge(bridge);
 	if(rc)
 	{
 		pr_err("pci_scan_root_bus_bridge() failed: %d\n", rc);
-		goto destroy_msi;
+		goto release_notifier;
 	}
 
 	pci_bus_size_bridges(bridge->bus);
@@ -811,6 +816,9 @@ static int rc_init(struct vepc_dev *vepc)
 	pci_bus_add_devices(bridge->bus);
 
 	return 0;
+
+release_notifier:
+	bus_unregister_notifier(&pci_bus_type, &vepc->pci_nb);
 
 destroy_msi:
 	msi_domain_destroy(vepc);
@@ -832,6 +840,7 @@ destroy_regs:
 
 static int rc_exit(struct vepc_dev *vepc)
 {
+	bus_unregister_notifier(&pci_bus_type, &vepc->pci_nb);
 	msi_domain_destroy(vepc);
 	if(vepc->sysdata.domain)
 		pci_bus_release_emul_domain_nr(vepc->sysdata.domain);
