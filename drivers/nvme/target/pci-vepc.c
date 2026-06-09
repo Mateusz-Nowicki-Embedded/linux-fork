@@ -11,6 +11,7 @@
 #include <linux/pci-epc.h>
 #include <linux/configfs.h>
 #include <linux/kstrtox.h>
+#include <linux/log2.h>
 
 #define MSI_NR_VECTORS 64
 
@@ -117,6 +118,53 @@ static u16 ep_pid;
 static u64 bar0_phys;
 static u32 bar0_size;
 
+static bool verify_pids_vids(void)
+{
+	if(!rc_vid)
+	{
+		pr_err("rc_vid is empty!\n");
+		return false;
+	}
+
+	if(!rc_pid)
+	{
+		pr_err("rc_pid is empty!\n");
+		return false;
+	}
+	if(!ep_vid)
+	{
+		pr_err("ep_vid is empty!\n");
+		return false;
+	}
+	if(!ep_pid)
+	{
+		pr_err("ep_pid is empty!\n");
+		return false;
+	}
+	
+	return true;
+}
+
+static bool verify_bar0(void)
+{
+	if(!is_power_of_2(bar0_size))
+	{
+		pr_err("bar0_size needs to be power of two!\n");
+		return false;
+	}
+	if(bar0_size < 64*1024)	//TODO: magic value
+	{
+		pr_err("bar0_size needs at least 64K bytes!\n");
+		return false;
+	}
+	if(!IS_ALIGNED(bar0_phys, bar0_size))
+	{
+		pr_err("bar0_phys is NOT aligned with bar0_size!\n");
+		return false;
+	}
+	return true;
+}
+
 static ssize_t vepc_cfg_enable_store(struct config_item *item, const char *page, size_t len)
 {
 	bool enable;
@@ -125,6 +173,20 @@ static ssize_t vepc_cfg_enable_store(struct config_item *item, const char *page,
 
 	mutex_lock(&cfg_lock);
 	pr_info("enable = %d!\n", enable);
+	if(enable)
+	{
+		if(!verify_pids_vids())
+			return -EINVAL;
+		if(!verify_bar0())
+			return -EINVAL;
+
+		//enable controller
+		pr_info("enabling...\n");
+	}
+	else
+	{
+		pr_info("disabling...\n");
+	}
 	mutex_unlock(&cfg_lock);
 
 	return len;
