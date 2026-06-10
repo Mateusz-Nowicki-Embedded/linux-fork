@@ -123,7 +123,9 @@ static const struct pci_epc_features *epc_get_features(struct pci_epc *epc, u8 f
 
 static int epc_start(struct pci_epc *epc)
 {
+	struct vepc_dev *vepc = epc_get_drvdata(epc);
 	pr_info("epc_start()\n");
+	pci_epc_init_notify(vepc->epc);
 	return 0;
 }
 
@@ -157,6 +159,9 @@ static int epc_register(struct vepc_dev *vepc)
 		pr_err("dma_coerce_mask_and_coherent() failed: %d\n", rc);
 		return rc;
 	}
+
+	rc = dma_declare_coherent_memory(parent, vepc->bar0_phys, vepc->bar0_phys, vepc->bar0_size);
+	
 
 	struct pci_epc *epc = devm_pci_epc_create(parent, &epc_ops);
 	if(IS_ERR(epc))
@@ -1611,6 +1616,7 @@ static int ep_hotplug(struct vepc_dev *vepc)
 	pci_unlock_rescan_remove();
 
 	msi_hotplug_irq(vepc);
+	pci_epc_linkup(vepc->epc);
 	return 0;
 }
 
@@ -1619,6 +1625,7 @@ static int ep_hotremove(struct vepc_dev *vepc)
 	struct pci_dev *rp = pci_get_slot(vepc->bridge->bus, PCI_DEVFN(0,0));
 	struct pci_bus *bus1 = rp ? rp->subordinate : NULL;
 	
+	pci_epc_linkdown(vepc->epc);
 	set_access_filter(vepc, ACC_F_EP_UR);
 
 	struct pci_dev *ep = bus1 ? pci_get_slot(bus1, PCI_DEVFN(0,0)) : NULL;
