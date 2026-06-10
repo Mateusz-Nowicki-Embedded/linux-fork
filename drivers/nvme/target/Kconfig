@@ -130,8 +130,9 @@ config NVME_TARGET_PCI_EPF
 
 config NVME_TARGET_PCI_VEPC
 	tristate "Virtual PCI Endpoint Function for PCI_EPF"
-	depends on NVME_TARGET && PCI_ENDPOINT && NVME_TARGET_PCI_EPF && PCI_ENDPOINT_CONFIGFS && DMA_DECLARE_COHERENT
+	depends on NVME_TARGET && PCI_ENDPOINT && NVME_TARGET_PCI_EPF && PCI_ENDPOINT_CONFIGFS && 
 	depends on NVME_CORE=y || NVME_CORE=NVME_TARGET
+	select DMA_DECLARE_COHERENT
 	help
 	  This enables the Virtual PCI Endpoint Controller,
 	  which allows creating a NVMe PCI controller using an endpoint mode
