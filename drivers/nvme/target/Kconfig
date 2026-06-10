@@ -129,7 +129,7 @@ config NVME_TARGET_PCI_EPF
 	  If unsure, say N.
 
 config NVME_TARGET_PCI_VEPC
-	bool "Virtual PCI Endpoint Function for PCI_EPF"
+	tristate "Virtual PCI Endpoint Function for PCI_EPF"
 	depends on NVME_TARGET && NVME_TARGET_PCI_EPF
 	depends on PCI_ENDPOINT_CONFIGFS && PCI_ENDPOINT
 	depends on X86=y && PCI_MSI

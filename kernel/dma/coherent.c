@@ -129,6 +129,7 @@ int dma_declare_coherent_memory(struct device *dev, phys_addr_t phys_addr,
 		_dma_release_coherent_memory(mem);
 	return ret;
 }
+EXPORT_SYMBOL_GPL(dma_declare_coherent_memory);
 
 void dma_release_coherent_memory(struct device *dev)
 {
@@ -137,6 +138,7 @@ void dma_release_coherent_memory(struct device *dev)
 		dev->dma_mem = NULL;
 	}
 }
+EXPORT_SYMBOL_GPL(dma_release_coherent_memory);
 
 static void *__dma_alloc_from_coherent(struct device *dev,
 				       struct dma_coherent_mem *mem,
