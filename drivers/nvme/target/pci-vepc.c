@@ -125,9 +125,7 @@ static const struct pci_epc_features *epc_get_features(struct pci_epc *epc, u8 f
 
 static int epc_start(struct pci_epc *epc)
 {
-	struct vepc_dev *vepc = epc_get_drvdata(epc);
 	pr_info("epc_start()\n");
-	pci_epc_init_notify(vepc->epc);
 	return 0;
 }
 
@@ -149,6 +147,7 @@ static void epc_unregister(struct vepc_dev *vepc)
 {
 	if(!vepc->epc)
 		return;
+	pci_epc_deinit_notify(vepc->epc);
 	pci_epc_mem_exit(vepc->epc);
 }
 
@@ -191,6 +190,7 @@ static int epc_register(struct vepc_dev *vepc)
 		return rc;
 	}
 
+	pci_epc_init_notify(vepc->epc);
 	pr_info("epc: '%s' registered\n", dev_name(&epc->dev));
 	return 0;
 }
