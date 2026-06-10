@@ -68,6 +68,8 @@ struct vepc_dev {
 	struct resource bus_res;
 	struct resource mem_res;
 	struct reg_space rc_regs;
+	u64 ob_win_phys;
+	u64 ob_win_size;
 
 	struct irq_domain    *msi_domain;
 	struct fwnode_handle *msi_fwnode;
@@ -92,7 +94,98 @@ enum acc_flags {
 	ACC_F_EP_UR	= (1 << 2),
 	ACC_F_RC_UR	= (1 << 3),
 };
+
 struct vepc_dev *vepc_dev;
+
+/* ---- PCI EPC ---- */
+static const struct pci_epc_features epc_features = {
+	.linkup_notifier = 1,
+	.msi_capable = 0,
+	.msix_capable = 1,
+	.intx_capable = 0,
+	.align = SZ_4K,
+	.bar[BAR_0] = {
+		.type = BAR_PROGRAMMABLE,
+		.only_64bit = true,
+	},
+	.bar[BAR_2] = {.type = BAR_DISABLED},
+	.bar[BAR_3] = {.type = BAR_DISABLED},
+	.bar[BAR_4] = {.type = BAR_DISABLED},
+	.bar[BAR_5] = {.type = BAR_DISABLED},
+};
+
+static const struct pci_epc_features *epc_get_features(struct pci_epc *epc, u8 func_no, 
+							u8 vfunc_no)
+{
+	return &epc_features;
+}
+
+static int epc_start(struct pci_epc *epc)
+{
+	pr_info("epc_start()\n");
+	return 0;
+}
+
+static void epc_stop(struct pci_epc *epc)
+{
+	pr_info("epc_stop()\n");
+}
+
+static const struct pci_epc_ops epc_ops = {
+	.get_features = epc_get_features,
+	.start = epc_start,
+	.stop = epc_stop,
+	.owner = THIS_MODULE,
+};
+
+
+
+static void epc_unregister(struct vepc_dev *vepc)
+{
+	if(!vepc->epc)
+		return;
+	pci_epc_mem_exit(vepc->epc);
+}
+
+static int epc_register(struct vepc_dev *vepc)
+{
+	struct device *parent = &vepc->plat_dev->dev;
+	int rc = dma_coerce_mask_and_coherent(parent, DMA_BIT_MASK(64));
+	if(rc)
+	{
+		pr_err("dma_coerce_mask_and_coherent() failed: %d\n", rc);
+		return rc;
+	}
+
+	struct pci_epc *epc = devm_pci_epc_create(parent, &epc_ops);
+	if(IS_ERR(epc))
+	{
+		rc = PTR_ERR(epc);
+		pr_err("devm_pci_epc_create() failed: %d\n", rc);
+		return rc;
+	}
+	epc_set_drvdata(epc, vepc);
+	vepc->epc = epc;
+
+	epc->max_functions = 1;
+	epc->max_vfs = devm_kcalloc(parent, epc->max_functions,
+				    sizeof(*epc->max_vfs), GFP_KERNEL);
+	if(!epc->max_vfs)
+	{
+		pr_err("devm_kcalloc() failed\n");
+		return -ENOMEM;
+	}
+
+	rc = pci_epc_mem_init(epc, vepc->ob_win_phys, vepc->ob_win_size, SZ_4K);
+	if(rc)
+	{
+		pr_err("pci_epc_mem_init() failed: %d\n", rc);
+		return rc;
+	}
+
+	pr_info("epc: '%s' registered\n", dev_name(&epc->dev));
+	return 0;
+}
 
 static int rc_init(struct vepc_dev *vepc);
 static int rc_exit(struct vepc_dev *vepc);
@@ -642,8 +735,8 @@ static u16 rc_vid;
 static u16 rc_did;
 static u16 ep_vid;
 static u16 ep_did;
-static u64 bar0_phys;
-static u32 bar0_size;
+static u64 mem_win_phys;
+static u32 mem_win_size;
 
 static ssize_t vepc_cfg_hotplug_store(struct config_item *item, const char *page, size_t len)
 {
@@ -714,28 +807,28 @@ static bool verify_pids_vids(void)
 	return true;
 }
 
-static bool verify_bar0(void)
+#define VEPC_BAR0_RESERVE SZ_64K
+#define VEPC_MEM_WIN_MIN  SZ_16M
+#define VEPC_MEM_WIN_MAX  SZ_256M
+
+static bool verify_mem_win(void)
 {
-	if(!is_power_of_2(bar0_size))
+	if(!IS_ALIGNED(mem_win_size, SZ_1M))
 	{
-		pr_err("bar0_size needs to be power of two!\n");
+		pr_err("mem_win_size must be a multiple of 1MB!\n");
 		return false;
 	}
-	if(bar0_size < 64*1024)	//TODO: magic value
+	if(mem_win_size  < VEPC_MEM_WIN_MIN || mem_win_size > VEPC_MEM_WIN_MAX)
 	{
-		pr_err("bar0_size needs at least 64K bytes!\n");
+		pr_err("mem_win_size out or range [16MB, 256MB]!\n");
 		return false;
 	}
-	if(bar0_size > 1 * 1024 * 1024) //TODO: magic value
+	if(!IS_ALIGNED(mem_win_phys, SZ_1M))
 	{
-		pr_err("bar0_size can't be larger than 1MB!\n");
+		pr_err("mem_win_phys in NOT 1MB aligned!\n");
 		return false;
 	}
-	if(!IS_ALIGNED(bar0_phys, bar0_size))
-	{
-		pr_err("bar0_phys is NOT aligned with bar0_size!\n");
-		return false;
-	}
+
 	return true;
 }
 
@@ -756,7 +849,7 @@ static ssize_t vepc_cfg_enable_store(struct config_item *item, const char *page,
 			return -EPERM;
 		}
 
-		if(!verify_pids_vids() || !verify_bar0())
+		if(!verify_pids_vids() || !verify_mem_win())
 		{
 			mutex_unlock(&cfg_lock);
 			return -EINVAL;
@@ -766,8 +859,10 @@ static ssize_t vepc_cfg_enable_store(struct config_item *item, const char *page,
 		vepc_dev->rc_vid = rc_vid;
 		vepc_dev->ep_did = ep_did;
 		vepc_dev->ep_vid = ep_vid;
-		vepc_dev->bar0_phys = bar0_phys;
-		vepc_dev->bar0_size = bar0_size;
+		vepc_dev->bar0_phys = mem_win_phys;
+		vepc_dev->bar0_size = VEPC_BAR0_RESERVE;
+		vepc_dev->ob_win_phys = mem_win_phys + VEPC_BAR0_RESERVE;
+		vepc_dev->ob_win_size = mem_win_phys - VEPC_BAR0_RESERVE;
 
 		//enable controller
 		pr_info("enabling...\n");
@@ -901,57 +996,57 @@ static ssize_t vepc_cfg_ep_did_store(struct config_item *item, const char *page,
 }
 CONFIGFS_ATTR(vepc_cfg_, ep_did);
 
-static ssize_t vepc_cfg_bar0_phys_show(struct config_item *item, char *page)
+static ssize_t vepc_cfg_mem_win_phys_show(struct config_item *item, char *page)
 {
 	ssize_t ret;
 	mutex_lock(&cfg_lock);
-	ret = sysfs_emit(page, "0x%llx\n", bar0_phys);
+	ret = sysfs_emit(page, "0x%llx\n", mem_win_phys);
 	mutex_unlock(&cfg_lock);
 
 	return ret;
 }
 
-static ssize_t vepc_cfg_bar0_phys_store(struct config_item *item, const char *page, size_t len)
+static ssize_t vepc_cfg_mem_win_phys_store(struct config_item *item, const char *page, size_t len)
 {
-	u64 bar0;
+	u64 mem_win;
 	if(!len)
 		return -EINVAL;
-	if(kstrtou64(page, 0, &bar0))
+	if(kstrtou64(page, 0, &mem_win))
 		return -EINVAL;
 
 	mutex_lock(&cfg_lock);
-	bar0_phys = bar0;
+	mem_win_phys = mem_win;
 	mutex_unlock(&cfg_lock);
 
 	return len;
 }
-CONFIGFS_ATTR(vepc_cfg_, bar0_phys);
+CONFIGFS_ATTR(vepc_cfg_, mem_win_phys);
 
-static ssize_t vepc_cfg_bar0_size_show(struct config_item *item, char *page)
+static ssize_t vepc_cfg_mem_win_size_show(struct config_item *item, char *page)
 {
 	ssize_t ret;
 	mutex_lock(&cfg_lock);
-	ret = sysfs_emit(page, "0x%x\n", bar0_size);
+	ret = sysfs_emit(page, "0x%x\n", mem_win_size);
 	mutex_unlock(&cfg_lock);
 
 	return ret;
 }
 
-static ssize_t vepc_cfg_bar0_size_store(struct config_item *item, const char *page, size_t len)
+static ssize_t vepc_cfg_mem_win_size_store(struct config_item *item, const char *page, size_t len)
 {
-	u32 bar0;
+	u32 mem_win;
 	if(!len)
 		return -EINVAL;
-	if(kstrtou32(page, 0, &bar0))
+	if(kstrtou32(page, 0, &mem_win))
 		return -EINVAL;
 
 	mutex_lock(&cfg_lock);
-	bar0_size = bar0;
+	mem_win_size = mem_win;
 	mutex_unlock(&cfg_lock);
 
 	return len;
 }
-CONFIGFS_ATTR(vepc_cfg_, bar0_size);
+CONFIGFS_ATTR(vepc_cfg_, mem_win_size);
 
 static struct configfs_attribute *vepc_cfg_attrs[] = {
 	&vepc_cfg_attr_hotplug,
@@ -961,8 +1056,8 @@ static struct configfs_attribute *vepc_cfg_attrs[] = {
 	&vepc_cfg_attr_rc_did,
 	&vepc_cfg_attr_ep_vid,
 	&vepc_cfg_attr_ep_did,
-	&vepc_cfg_attr_bar0_phys,
-	&vepc_cfg_attr_bar0_size,
+	&vepc_cfg_attr_mem_win_phys,
+	&vepc_cfg_attr_mem_win_size,
 	NULL
 };
 
@@ -1172,11 +1267,25 @@ static int rc_exit(struct vepc_dev *vepc)
 
 static int rc_hotplug(struct vepc_dev *vepc)
 {
-	return rc_init(vepc);
+	int rc = rc_init(vepc);
+	if(rc)
+	{
+		pr_err("rc_init() failed: %d\n", rc);
+		return rc;
+	}
+	rc = epc_register(vepc);
+	if(rc)
+	{
+		pr_err("epc_register() failed: %d\n", rc);
+		return rc;
+	}
+	return rc;
 }
 
 static int rc_hotremove(struct vepc_dev *vepc)
 {
+	epc_unregister(vepc);
+	ep_hotremove(vepc);
 	return rc_exit(vepc);
 }
 
