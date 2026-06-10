@@ -54,9 +54,10 @@ struct vepc_dev {
 	u16 ep_did;
 	u64 bar0_phys;
 	u64 bar0_size;
-	void __iomem *bar0_virt;
+	//void __iomem *bar0_virt;
 	struct reg_space ep_regs;
 	struct pci_epc *epc;
+	bool enabled;
 
 
 	/* PCIe switch */
@@ -569,7 +570,7 @@ const struct reg_entry ep_regs_layout[] = {
 /* Device Capabilities */
    {  .offset = 0x64, .size = 4, .default_val = 0x00008001u, .ro_mask = 0xFFFFFFFFu },
 /* Device Control + Device Status */
-   {  .offset = 0x68, .size = 4, .rw1c_mask = 0x000F0000u, .ro_mask = 0x00200000u },
+   {  .offset = 0x68, .size = 4, .rw1c_mask = 0x000F0000u, .ro_mask = 0x00208000u },
 /* Link Capabilities */
    {  .offset = 0x6C, .size = 4, .default_val = 0x00000045u, .ro_mask = 0xFFFFFFFFu },
 /* Link Control + Link Status */
@@ -746,7 +747,7 @@ static ssize_t vepc_cfg_hotplug_store(struct config_item *item, const char *page
 	if(!plug)
 		return -EINVAL;
 
-	if(vepc_dev->bar0_virt)
+	if(vepc_dev->enabled)
 		return -EPERM;
 
 	pr_info("hotplug requested!\n");
@@ -766,7 +767,7 @@ static ssize_t vepc_cfg_hotremove_store(struct config_item *item, const char *pa
 	if(!remove)
 		return -EINVAL;
 
-	if(!vepc_dev->bar0_virt)
+	if(!vepc_dev->enabled)
 		return -EPERM;
 
 	pr_info("hotremoval requested!\n");
@@ -807,9 +808,17 @@ static bool verify_pids_vids(void)
 	return true;
 }
 
-#define VEPC_BAR0_RESERVE SZ_64K
-#define VEPC_MEM_WIN_MIN  SZ_16M
-#define VEPC_MEM_WIN_MAX  SZ_256M
+/*
+ * mem window layout:
+ * [ Hot-plug mem window (4M)  | translation window for EPC (28M)]
+ * [BAR0 (64K)]
+ *
+ * BAR0 lives in the beginning of Hot-plug mem
+ */
+#define VEPC_BAR0_SIZE		SZ_64K
+#define VEPC_HP_SIZE		SZ_4M
+#define VEPC_MEM_WIN_MIN	SZ_32M
+#define VEPC_MEM_WIN_MAX	SZ_256M
 
 static bool verify_mem_win(void)
 {
@@ -820,7 +829,7 @@ static bool verify_mem_win(void)
 	}
 	if(mem_win_size  < VEPC_MEM_WIN_MIN || mem_win_size > VEPC_MEM_WIN_MAX)
 	{
-		pr_err("mem_win_size out or range [16MB, 256MB]!\n");
+		pr_err("mem_win_size out or range [32MB, 256MB]!\n");
 		return false;
 	}
 	if(!IS_ALIGNED(mem_win_phys, SZ_1M))
@@ -860,9 +869,9 @@ static ssize_t vepc_cfg_enable_store(struct config_item *item, const char *page,
 		vepc_dev->ep_did = ep_did;
 		vepc_dev->ep_vid = ep_vid;
 		vepc_dev->bar0_phys = mem_win_phys;
-		vepc_dev->bar0_size = VEPC_BAR0_RESERVE;
-		vepc_dev->ob_win_phys = mem_win_phys + VEPC_BAR0_RESERVE;
-		vepc_dev->ob_win_size = mem_win_phys - VEPC_BAR0_RESERVE;
+		vepc_dev->bar0_size = VEPC_BAR0_SIZE;
+		vepc_dev->ob_win_phys = mem_win_phys + VEPC_HP_SIZE;
+		vepc_dev->ob_win_size = mem_win_phys - VEPC_HP_SIZE;
 
 		//enable controller
 		pr_info("enabling...\n");
@@ -1113,7 +1122,6 @@ static void __exit vepc_exit_module(void)
 
 /* 1MiB-aligned helper */
 #define RC_MEM_BASE(phys) ((phys) & ~((1ULL << 20) - 1))
-#define RC_MEM_LIMIT(phys) (RC_MEM_BASE(phys) + (1ULL << 20) - 1)
 
 static int rc_init(struct vepc_dev *vepc)
 {
@@ -1164,8 +1172,8 @@ static int rc_init(struct vepc_dev *vepc)
 
 	vepc->mem_res	= (struct resource) {
 		.name	= "vepc-mem",
-		.start	= RC_MEM_BASE(vepc->bar0_phys),
-		.end	= RC_MEM_LIMIT(vepc->bar0_phys),
+		.start	= vepc->bar0_phys,
+		.end	= vepc->bar0_phys + VEPC_HP_SIZE - 1,
 		.flags	= IORESOURCE_MEM | IORESOURCE_MEM_64 | IORESOURCE_PREFETCH,
 	};
 	pci_add_resource(&bridge->windows, &vepc->mem_res);
@@ -1539,6 +1547,7 @@ static int ep_init(struct vepc_dev *vepc)
 	}
 	vepc->ep_regs.dev = vepc;
 
+	/*
 	vepc->bar0_virt = ioremap(vepc->bar0_phys, vepc->bar0_size);
 	if(!vepc->bar0_virt)
 	{
@@ -1547,13 +1556,17 @@ static int ep_init(struct vepc_dev *vepc)
 		goto reg_destroy;
 	}
 	memset_io(vepc->bar0_virt, 0, vepc->bar0_size);
+	*/
 
 	ep_reset(RESET_POWER_ON, vepc);
+	vepc->enabled = true;
 	return 0;
 
+/*	
 reg_destroy:
 	reg_space_destroy(&vepc->ep_regs);
 	return rc;
+	*/
 }
 
 static int ep_exit(struct vepc_dev *vepc)
@@ -1561,11 +1574,14 @@ static int ep_exit(struct vepc_dev *vepc)
 	int rc = reg_space_destroy(&vepc->ep_regs);
 	if(rc)
 		pr_err("reg_space_destroy() failed: %d\n", rc);
+	/*
 	if(vepc->bar0_virt)
 	{
 		iounmap(vepc->bar0_virt);
 		vepc->bar0_virt = NULL;
 	}
+	*/
+	vepc->enabled = false;
 
 	return 0;
 }
