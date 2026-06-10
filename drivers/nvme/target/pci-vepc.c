@@ -13,6 +13,8 @@
 #include <linux/kstrtox.h>
 #include <linux/nodemask_types.h>
 #include <linux/log2.h>
+#include <linux/dma-mapping.h>
+#include <linux/dma-map-ops.h>
 
 #define MSI_NR_VECTORS 64
 
