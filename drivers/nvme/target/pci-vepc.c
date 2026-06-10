@@ -1219,8 +1219,7 @@ static int rc_init(struct vepc_dev *vepc)
 		goto release_notifier;
 	}
 
-	pci_bus_size_bridges(bridge->bus);
-	pci_bus_assign_resources(bridge->bus);
+	pci_bus_claim_resources(bridge->bus);
 	vepc->bridge = bridge;
 	
 	pci_bus_add_devices(bridge->bus);
